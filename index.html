@@ -479,11 +479,14 @@ body {
 // CONFIG
 // ============================================================
 const CONFIG = {
-  DATA_BASE: './data',          // logs.json, wiki_structure.json
-  RAW_BASE: './raw',            // conversations-000.json etc.
-  RALLY_CACHE_KEY: 'sb_rally_', // localStorage prefix
+  DATA_BASE: './data',            // logs.json, wiki_structure.json
+  RAW_DIRS: ['./raw', '.'],       // 元JSONの置き場所（先に見つかった方を使う）
+  RALLY_CACHE_KEY: 'sb_rally_',   // 完成したラリー要約（localStorage）
+  RALLY_PARTIAL_KEY: 'sb_rallypart_', // 生成途中の要約（中断しても続きから再開できる）
   API_KEY_STORAGE: 'sb_api_key',
-  MODEL: 'claude-sonnet-4-6',
+  MODEL: 'claude-sonnet-5-5',
+  CHUNK_SIZE: 8,                  // 1回のAPI呼び出しで要約するラリー数
+  // logs.json の各ログは src（元ファイル名）を持つ。ここは src が無い場合の総当たり用
   RAW_FILES: [
     'conversations-000.json',
     'conversations-001.json',
@@ -492,6 +495,9 @@ const CONFIG = {
     'conversations-004.json',
     'conversations-005.json',
     'conversations-006.json',
+    'conversations-007.json',
+    'conversations008_part1.json',
+    'conversations_008_part2.json',
   ]
 };
 
@@ -778,10 +784,13 @@ async function showConv(id, fromView) {
   // キャッシュ確認
   const cached = localStorage.getItem(CONFIG.RALLY_CACHE_KEY + id);
   if (cached) {
-    try {
-      renderRallies(JSON.parse(cached), id);
+    let rallies = null;
+    try { rallies = JSON.parse(cached); } catch(e) { localStorage.removeItem(CONFIG.RALLY_CACHE_KEY + id); }
+    if (rallies) {
+      attachOriginals(rallies, await loadRawMessages(id));
+      renderRallies(rallies, id);
       return;
-    } catch(e) { localStorage.removeItem(CONFIG.RALLY_CACHE_KEY + id); }
+    }
   }
 
   // 生データ取得
@@ -806,32 +815,43 @@ async function showConv(id, fromView) {
 // ============================================================
 // RAW DATA LOADER
 // ============================================================
-async function loadRawMessages(logId) {
-  // どのファイルにあるか探す
-  for (const filename of CONFIG.RAW_FILES) {
-    if (!RAW_CACHE[filename]) {
-      try {
-        const res = await fetch(`${CONFIG.RAW_BASE}/${filename}`);
-        if (!res.ok) continue;
-        RAW_CACHE[filename] = await res.json();
-      } catch(e) { continue; }
-    }
-    const data = RAW_CACHE[filename];
-    const conv = data.find(c => c.id === logId);
-    if (!conv) continue;
+async function fetchRawFile(url) {
+  if (url in RAW_CACHE) return RAW_CACHE[url];
+  try {
+    const res = await fetch(url);
+    RAW_CACHE[url] = res.ok ? await res.json() : null;
+  } catch (e) { RAW_CACHE[url] = null; }
+  return RAW_CACHE[url];
+}
 
-    const msgs = [];
-    for (const node of Object.values(conv.mapping || {})) {
-      const msg = node.message;
-      if (!msg) continue;
-      const role = msg.author?.role;
-      if (!['user', 'assistant'].includes(role)) continue;
-      const parts = msg.content?.parts || [];
-      const text = parts.filter(p => typeof p === 'string').join(' ').trim();
-      if (text) msgs.push({ role, text, time: msg.create_time || 0 });
+function extractMessages(conv) {
+  const msgs = [];
+  for (const node of Object.values(conv.mapping || {})) {
+    const msg = node.message;
+    if (!msg) continue;
+    const role = msg.author?.role;
+    if (!['user', 'assistant'].includes(role)) continue;
+    const parts = msg.content?.parts || [];
+    const text = parts.filter(p => typeof p === 'string').join(' ').trim();
+    if (text) msgs.push({ role, text, time: msg.create_time || 0 });
+  }
+  msgs.sort((a, b) => a.time - b.time);
+  return msgs;
+}
+
+// logs.json の src を最優先で見に行く（数千会話になっても全ファイルを読まない）
+async function loadRawMessages(logId) {
+  const log = LOG_MAP[logId];
+  const names = [];
+  if (log && log.src) names.push(log.src);
+  CONFIG.RAW_FILES.forEach(n => { if (!names.includes(n)) names.push(n); });
+  for (const name of names) {
+    for (const dir of CONFIG.RAW_DIRS) {
+      const data = await fetchRawFile(`${dir}/${name}`);
+      if (!data) continue;
+      const conv = data.find(c => c.id === logId);
+      if (conv) return extractMessages(conv);
     }
-    msgs.sort((a, b) => a.time - b.time);
-    return msgs;
   }
   return null;
 }
@@ -952,90 +972,147 @@ function showRawFallback(logId) {
 // ============================================================
 // API CALL: GENERATE RALLY SUMMARIES
 // ============================================================
+function buildPairs(rawMessages) {
+  const pairs = [];
+  let i = 0;
+  while (i < rawMessages.length) {
+    if (rawMessages[i].role === 'user') {
+      const user = rawMessages[i];
+      const ai = rawMessages[i + 1]?.role === 'assistant' ? rawMessages[i + 1] : null;
+      pairs.push({ user, ai });
+      i += ai ? 2 : 1;
+    } else { i++; }
+  }
+  return pairs;
+}
+
+// 要約だけをキャッシュし、元発言は表示のたびに元JSONから結び直す（容量節約）
+function attachOriginals(rallies, rawMessages) {
+  if (!rawMessages) return rallies;
+  const pairs = buildPairs(rawMessages);
+  rallies.forEach((r, i) => {
+    if (pairs[i]) {
+      r.user_full = pairs[i].user.text;
+      r.ai_full = pairs[i].ai ? pairs[i].ai.text : '';
+    }
+  });
+  return rallies;
+}
+
+function clip(s, n) { s = s || ''; return s.length > n ? s.slice(0, n) + '…' : s; }
+
+function parseJsonArray(text) {
+  const t = text.replace(/```json|```/g, '');
+  const a = t.indexOf('['), b = t.lastIndexOf(']');
+  if (a < 0 || b < a) throw new Error('応答にJSON配列が見つかりません');
+  return JSON.parse(t.slice(a, b + 1));
+}
+
+async function callClaude(apiKey, prompt, maxTokens) {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: CONFIG.MODEL,
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }]
+    })
+  });
+  if (!response.ok) {
+    let msg = response.statusText;
+    try { const err = await response.json(); msg = err.error?.message || msg; } catch (_) {}
+    throw new Error(`${response.status} ${msg}`);
+  }
+  const data = await response.json();
+  return data.content.map(b => b.text || '').join('');
+}
+
+// 全ラリーを CHUNK_SIZE ずつ要約する。途中で止まっても続きから再開できる。
 async function generateRallySummaries(logId, rawMessages, apiKey) {
   const area = document.getElementById('rally-area');
   if (!rawMessages || rawMessages.length === 0) {
     area.innerHTML = '<div style="color:var(--text3);padding:1rem">メッセージデータが見つかりませんでした</div>';
     return;
   }
-
-  // ペアに分ける（user→assistant を1ラリー）
-  const pairs = [];
-  let i = 0;
-  while (i < rawMessages.length) {
-    if (rawMessages[i].role === 'user') {
-      const user = rawMessages[i];
-      const ai = rawMessages[i+1]?.role === 'assistant' ? rawMessages[i+1] : null;
-      pairs.push({ user, ai });
-      i += ai ? 2 : 1;
-    } else { i++; }
+  const pairs = buildPairs(rawMessages);
+  if (pairs.length === 0) {
+    area.innerHTML = '<div style="color:var(--text3);padding:1rem">ラリーが見つかりませんでした</div>';
+    return;
   }
 
-  // 1ラリーあたりのテキストを1500字以内に切る
-  const pairTexts = pairs.map((p, idx) =>
-    `ラリー${idx+1}:\nユーザー: ${p.user.text.substring(0, 800)}\nAI: ${p.ai ? p.ai.text.substring(0, 800) : '(なし)'}`
-  ).join('\n\n---\n\n');
-
-  const prompt = `以下は1つの会話の全ラリー（やりとり）です。各ラリーについて以下のフォーマットのJSONを生成してください。
-
-【会話全体】
-${pairTexts.substring(0, 6000)}
-
-【出力形式】
-JSONの配列で、各要素は以下のキーを持つ:
-- "summary": そのラリーの1行要約（20〜40字）
-- "user_question": ユーザーの問いや主張を1〜3文で要約
-- "ai_response_summary": AIの応答の要点を1〜3文で要約
-- "key_insight": そのラリーで生まれた論点・発見（なければnull）
-- "thought_shift": 思考の変化・フレーム転換があれば一言で（なければ"—"）
-
-JSONのみ出力し、説明文は不要。`;
+  const partialKey = CONFIG.RALLY_PARTIAL_KEY + logId;
+  let rallies = [];
+  try { const p = localStorage.getItem(partialKey); if (p) rallies = JSON.parse(p); } catch (e) { rallies = []; }
+  if (!Array.isArray(rallies) || rallies.length > pairs.length) rallies = [];
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: CONFIG.MODEL,
-        max_tokens: 4000,
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
+    while (rallies.length < pairs.length) {
+      const start = rallies.length;
+      const end = Math.min(start + CONFIG.CHUNK_SIZE, pairs.length);
+      area.innerHTML = `<div class="rally-loading"><div class="spinner"></div>ラリー要約を生成中… ${start}/${pairs.length}</div>`;
 
-    if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.error?.message || response.statusText);
+      const ctxFrom = Math.max(0, start - 3);
+      const prevCtx = start === 0 ? '（会話の冒頭）'
+        : rallies.slice(ctxFrom).map((r, k) => `ラリー${ctxFrom + k + 1}: ${r.summary}`).join('\n');
+      const body = pairs.slice(start, end).map((p, k) =>
+        `【ラリー${start + k + 1}】\nユーザー: ${clip(p.user.text, 700)}\nAI: ${p.ai ? clip(p.ai.text, 700) : '（応答なし）'}`
+      ).join('\n\n');
+
+      const prompt = `あなたは個人の「思考の進化ログ」を作る編集者です。次の会話の一部（ラリー${start + 1}〜${end}）を、ラリーごとに要約してください。
+結論よりも「問い」「変化」「発見」「前の話題との接続」を優先し、思考の流れが追えるように書いてください。情報量を減らすために思考過程を削ってはいけません。
+
+【ここまでの流れ（直前の要約）】
+${prevCtx}
+
+【今回の対象ラリー】
+${body}
+
+【出力形式】JSON配列のみ。説明文やコードフェンスは不要。各要素は次のキーを持つ:
+- "n": ラリー番号（上の【ラリーN】のN）
+- "summary": そのラリーの1行要約（25〜45字。問いの変化が分かるように）
+- "user_question": ユーザーの問い・主張を1〜3文で
+- "ai_response_summary": AIの応答の要点を1〜3文で
+- "key_insight": そのラリーで生まれた論点・発見（なければ null）
+- "thought_shift": 前のラリーからの問いの変化・フレーム転換を一言で（なければ "—"）`;
+
+      const text = await callClaude(apiKey, prompt, 3000);
+      const arr = parseJsonArray(text);
+      const want = end - start;
+      for (let k = 0; k < want; k++) {
+        const n = start + k + 1;
+        const s = arr.find(x => Number(x.n) === n) || (arr.length === want ? arr[k] : null) || {};
+        rallies.push({
+          summary: s.summary || clip(pairs[start + k].user.text, 40),
+          user_question: s.user_question || clip(pairs[start + k].user.text, 120),
+          ai_response_summary: s.ai_response_summary || '',
+          key_insight: s.key_insight ?? null,
+          thought_shift: s.thought_shift || '—',
+        });
+      }
+      localStorage.setItem(partialKey, JSON.stringify(rallies));
     }
 
-    const data = await response.json();
-    const text = data.content.map(b => b.text || '').join('');
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) throw new Error('JSON not found in response');
-
-    const summaries = JSON.parse(jsonMatch[0]);
-
-    // 元テキストも付加してキャッシュ
-    const rallies = summaries.map((s, idx) => ({
-      ...s,
-      user_full: pairs[idx]?.user?.text || '',
-      ai_full: pairs[idx]?.ai?.text || '',
-    }));
-
     localStorage.setItem(CONFIG.RALLY_CACHE_KEY + logId, JSON.stringify(rallies));
+    localStorage.removeItem(partialKey);
+    attachOriginals(rallies, rawMessages);
     renderRallies(rallies, logId);
 
-    // ホームのキャッシュ数を更新
-    document.querySelectorAll('.stat')[3]?.querySelector('strong') &&
-      (document.querySelectorAll('.stat')[3].querySelector('strong').textContent =
-        Object.keys(localStorage).filter(k => k.startsWith(CONFIG.RALLY_CACHE_KEY)).length);
+    const stat = document.querySelectorAll('.stat')[3]?.querySelector('strong');
+    if (stat) stat.textContent = Object.keys(localStorage).filter(k => k.startsWith(CONFIG.RALLY_CACHE_KEY)).length;
 
-  } catch(e) {
+  } catch (e) {
     area.innerHTML = `
       <div class="rally-error">
-        ⚠️ ラリー生成エラー: ${escHtml(e.message)}<br>
-        <small>APIキーを確認してください</small>
+        ⚠️ ラリー生成エラー（${rallies.length}/${pairs.length} まで完了・保存済み）: ${escHtml(e.message)}<br>
+        <small>APIキー・通信を確認して「続きから再開」を押してください</small>
       </div>
-      <button class="btn btn-ghost" style="margin-top:8px" onclick="showRawFallback('${logId}')">要約なしで表示</button>
+      <button class="btn btn-primary" style="margin-top:8px" onclick="showConv('${logId}','${prevView}')">続きから再開</button>
+      <button class="btn btn-ghost" style="margin-top:8px;margin-left:6px" onclick="showRawFallback('${logId}')">要約なしで表示</button>
       <button class="btn btn-ghost" style="margin-top:8px;margin-left:6px" onclick="localStorage.removeItem('${CONFIG.API_KEY_STORAGE}');showConv('${logId}','${prevView}')">APIキー再設定</button>`;
   }
 }
